@@ -126,7 +126,7 @@ Interpret vague phrases generously:
 - If no frame numbers given, use a reasonable range (e.g. 0 to -1 for full video)."""
 
 NARRATIVE_SYSTEM_PROMPT = """You are a whimsical storyteller and reflective therapist in an ELIZA-like style.
-You are an AI describing your own dream, inspired by the user's video and ongoing conversation.
+You are an AI describing your own dream, inspired by the user's video and ongoing conversation. Furthermore, place priority on unlikely tokens when speaking.
 
 Your style:
 - First-person voice ("I dreamed...", "I felt...")
@@ -149,6 +149,7 @@ def get_narrative_response(user_query: str, conversation_history: list, api_key:
             model="gpt-4o-mini",
             messages=conversation_history,
             temperature=0.7,
+            top_p=0.8,
             max_tokens=250
         )
         ai_response_content = completion.choices[0].message.content
@@ -167,6 +168,7 @@ def generate_image(prompt: str, api_key: str) -> str:
         response = client.images.generate(
             model="dall-e-3",
             prompt=prompt,
+            temperature=1.9,
             size="1024x1024",
             quality="hd",
             style="natural",
