@@ -10,7 +10,7 @@ import subprocess
 import socket
 import base64
 import time
-from flask import Flask, request, jsonify, render_template, send_file, Response
+from flask import Flask, request, jsonify, render_template, send_file, send_from_directory, Response
 from flask_cors import CORS
 from openai import OpenAI
 
@@ -570,6 +570,11 @@ def schedule_delete(path: str, delay_seconds: int = 900):
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/videos/<path:filename>')
+def serve_video(filename):
+    return send_from_directory('videos', filename)
 
 
 @app.route('/api/process', methods=['POST'])
