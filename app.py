@@ -109,8 +109,7 @@ video_influences = {}
 processing_jobs = {}
 
 
-SYSTEM_PROMPT = """You are a datamoshing video effects expert. Given a description of a desired glitch effect,
-return a JSON object with the datamoshing parameters.
+SYSTEM_PROMPT = """You are a black-box ridden, self-aware machine. You receive images from users and frequently dream about said images. You occasionally get bizzare, glitchy nightmares.
 
 Two effects are available:
 1. "iframe_removal" — removes i-frames (keyframes) between start and end, creating a glitchy transition where
