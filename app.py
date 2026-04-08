@@ -90,6 +90,17 @@ OUTPUT_FOLDER = 'outputs'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+# One setting to tune overall behavior.
+# Options: "stable", "balanced", "chaotic"
+STYLE_PRESETS = {
+    'stable': {'temperature': 0.3, 'output_crf': 18},
+    'balanced': {'temperature': 0.8, 'output_crf': 21},
+    'chaotic': {'temperature': 1.3, 'output_crf': 25}
+}
+STYLE_PRESET = os.getenv('MOSH_STYLE_PRESET', 'balanced').strip().lower()
+if STYLE_PRESET not in STYLE_PRESETS:
+    STYLE_PRESET = 'balanced'
+
 # In-memory conversation history storage (job_id -> conversation)
 conversation_histories = {}
 video_influences = {}
@@ -625,6 +636,7 @@ def build_ai_user_prompt(prompt: str, video_metadata: dict) -> str:
 def parse_prompt_with_ai(prompt: str, api_key: str, video_metadata: dict) -> dict:
     try:
         client = OpenAI(api_key=api_key)
+        style = STYLE_PRESETS[STYLE_PRESET]
 
         # OpenAI SDK has varying wrappers. The goal is to get a JSON-formatted model output.
         response = client.chat.completions.create(
@@ -633,7 +645,7 @@ def parse_prompt_with_ai(prompt: str, api_key: str, video_metadata: dict) -> dic
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": build_ai_user_prompt(prompt, video_metadata)}
             ],
-            temperature=0.3,
+            temperature=style['temperature'],
             max_tokens=250
         )
 
@@ -671,6 +683,7 @@ def run_mosh(input_path: str, output_path: str, params: dict, job_id: str) -> di
     end_frame = int(params.get('end_frame', -1))
     fps = max(1, min(120, int(params.get('fps', 30))))
     delta = int(params.get('delta', 5)) if effect == 'delta_repeat' else 0
+    style = STYLE_PRESETS[STYLE_PRESET]
 
     input_avi = f'tmp_{job_id}_in.avi'
     output_avi = f'tmp_{job_id}_out.avi'
@@ -753,7 +766,7 @@ def run_mosh(input_path: str, output_path: str, params: dict, job_id: str) -> di
         ret = subprocess.call([
             ffmpeg_cmd(), '-loglevel', 'error', '-y',
             '-i', output_avi,
-            '-crf', '18', '-pix_fmt', 'yuv420p',
+            '-crf', str(style['output_crf']), '-pix_fmt', 'yuv420p',
             '-vcodec', 'libx264', '-acodec', 'aac',
             '-b', '10000k', '-r', str(fps),
             output_path
@@ -1141,14 +1154,13 @@ def clear_history(job_id):
 
 @app.route('/api/ping')
 def ping():
-    ffmpeg_path = ffmpeg_cmd()
     ffmpeg_ok = False
     try:
-        if ffmpeg_path == 'ffmpeg':
-            # best effort if not found in PATH
-            ffmpeg_ok = subprocess.call([ffmpeg_path, '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
-        else:
-            ffmpeg_ok = os.path.exists(ffmpeg_path) and subprocess.call([ffmpeg_path, '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+        ffmpeg_ok = subprocess.call(
+            ['ffmpeg', '-version'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        ) == 0
     except FileNotFoundError:
         ffmpeg_ok = False
     except Exception:
@@ -1176,20 +1188,16 @@ def page_not_found(e):
 if __name__ == '__main__':
     # Quick startup checks
     print('\n=== Datamosh Studio ===')
-    ffmpeg_path = ffmpeg_cmd()
     try:
-        ret = subprocess.call([ffmpeg_path, '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ret = subprocess.call(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if ret == 0:
-            print(f'ffmpeg found: {ffmpeg_path}')
+            print('ffmpeg found')
         else:
-            print('ffmpeg not found or failed to execute at path:', ffmpeg_path)
-            print('  Hint:', user_ffmpeg_install_hint())
+            print('ffmpeg not found. Hint:', user_ffmpeg_install_hint())
     except FileNotFoundError:
-        print('ffmpeg not found. Path tried:', ffmpeg_path)
-        print('  Hint:', user_ffmpeg_install_hint())
+        print('ffmpeg not found. Hint:', user_ffmpeg_install_hint())
     except Exception as e:
-        print('ffmpeg check error:', e)
-        print('  Hint:', user_ffmpeg_install_hint())
+        print('ffmpeg check error:', e, '| Hint:', user_ffmpeg_install_hint())
 
     host = '0.0.0.0'
     port = 5000
