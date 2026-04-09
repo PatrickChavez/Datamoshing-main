@@ -1249,9 +1249,9 @@ if __name__ == '__main__':
     except Exception as e:
         print('ffmpeg check error:', e, '| Hint:', user_ffmpeg_install_hint())
 
-    host = '0.0.0.0'
-    port = 5000
-    if is_port_in_use('127.0.0.1', port):
+    host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', '5000'))
+    if port == 5000 and is_port_in_use('127.0.0.1', port):
         print(f'Cannot start: port {port} is already in use.')
         print('Close the other server/process, then try again.')
         print('Windows helpers:')
@@ -1259,5 +1259,5 @@ if __name__ == '__main__':
         print('  Stop-Process -Id <PID> -Force')
         sys.exit(1)
 
-    print(f'Open http://127.0.0.1:{port}')
+    print(f'Starting server on {host}:{port}')
     app.run(debug=False, host=host, port=port)
