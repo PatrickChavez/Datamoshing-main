@@ -273,6 +273,15 @@
                             <option value="4">4</option>
                         </select>
                     </div>
+                    <div class="flex items-center gap-3">
+                        <label for="generationMode" class="text-xs text-zinc-500 uppercase tracking-wider">Quality</label>
+                        <select id="generationMode"
+                            class="bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-violet-500">
+                            <option value="fast">Fast</option>
+                            <option value="full">Full quality</option>
+                        </select>
+                        <span id="generationModeHint" class="text-xs text-zinc-500">Fast skips heavy post-processing for speed.</span>
+                    </div>
                     <button onclick="generateDreamImage()"
                         class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 disabled:bg-zinc-800 disabled:text-zinc-600 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
                         id="genImgBtn">
@@ -351,6 +360,33 @@
             throw new Error('Failed to reach backend.');
         }
 
+        async function parseApiResponse(res, fallbackMessage) {
+            const contentType = (res.headers.get('content-type') || '').toLowerCase();
+            const rawText = await res.text();
+            let data = null;
+
+            if (rawText) {
+                try {
+                    data = JSON.parse(rawText);
+                } catch (_e) {
+                    data = null;
+                }
+            }
+
+            if (res.ok) {
+                if (data && typeof data === 'object') return data;
+                throw new Error('Server returned an empty or invalid JSON response.');
+            }
+
+            const serverMessage = data && typeof data.error === 'string' && data.error.trim()
+                ? data.error.trim()
+                : '';
+            const shortBody = rawText ? rawText.slice(0, 180).replace(/\s+/g, ' ').trim() : '';
+            const detail = serverMessage || shortBody || fallbackMessage || 'Request failed.';
+            const ctHint = contentType ? ` [${contentType}]` : '';
+            throw new Error(`HTTP ${res.status}${ctHint}: ${detail}`);
+        }
+
         function networkDebugInfo() {
             const attempts = lastNetworkAttempts.length
                 ? lastNetworkAttempts.join('<br>')
@@ -378,8 +414,32 @@
 
         window.onload = () => {
             checkServerMode();
+            initializeGenerationMode();
             refreshServerKeyIndicator();
         };
+
+        function initializeGenerationMode() {
+            const modeSelect = document.getElementById('generationMode');
+            const hint = document.getElementById('generationModeHint');
+            if (!modeSelect || !hint) return;
+
+            const host = (window.location.hostname || '').toLowerCase();
+            const isHosted = host.includes('onrender.com');
+            modeSelect.value = isHosted ? 'fast' : 'full';
+            updateGenerationModeHint();
+            modeSelect.addEventListener('change', updateGenerationModeHint);
+        }
+
+        function updateGenerationModeHint() {
+            const modeSelect = document.getElementById('generationMode');
+            const hint = document.getElementById('generationModeHint');
+            if (!modeSelect || !hint) return;
+            if (modeSelect.value === 'full') {
+                hint.textContent = 'Full quality enables matrix inference + datamosh (slower).';
+            } else {
+                hint.textContent = 'Fast skips heavy post-processing for speed.';
+            }
+        }
 
         async function refreshServerKeyIndicator() {
             const statusEl = document.getElementById('serverKeyStatus');
@@ -505,13 +565,13 @@
 
             try {
                 const res = await fetchWithFallback('/api/process', { method: 'POST', body: fd });
-                const data = await res.json();
+                const data = await parseApiResponse(res, 'Processing failed.');
                 if (data.success) {
                     currentJobId = data.job_id;
                     showNarrativeSection();
                     applyDreamBootstrap(data);
                 } else {
-                    showError(data.error || 'Processing failed.');
+                    showError(data.error || 'Processing failed.' + networkDebugInfo());
                 }
             } catch (e) {
                 showError('Network error: ' + e.message + networkDebugInfo());
@@ -597,7 +657,7 @@
                         })
                     });
                 }
-                const data = await res.json();
+                const data = await parseApiResponse(res, 'Failed to generate narrative.');
                 if (data.success) {
                     typewriterDisplay(data.narrative);
                     document.getElementById('narrativeInput').value = '';
@@ -611,7 +671,7 @@
                     if (mediaStatus) mediaStatus.textContent = '';
                     hideError();
                 } else {
-                    showError(data.error || 'Failed to generate narrative.');
+                    showError((data.error || 'Failed to generate narrative.') + networkDebugInfo());
                 }
             } catch (e) {
                 showError('Network error: ' + e.message + networkDebugInfo());
@@ -625,6 +685,8 @@
             const prompt = document.getElementById('imagePrompt').value.trim();
             if (!prompt) { showError('Please provide an image description.'); return; }
             const imageCount = Math.max(1, Math.min(4, parseInt(document.getElementById('imageCount').value || '1', 10) || 1));
+            const generationMode = (document.getElementById('generationMode')?.value || 'fast');
+            const useFullQuality = generationMode === 'full';
 
             const btn = document.getElementById('genImgBtn');
             btn.disabled = true;
@@ -638,10 +700,13 @@
                     body: JSON.stringify({
                         job_id: currentJobId,
                         prompt: prompt,
-                        image_count: imageCount
+                        image_count: imageCount,
+                        fast_mode: !useFullQuality,
+                        apply_datamosh: useFullQuality,
+                        compute_matrix: useFullQuality
                     })
                 });
-                const data = await res.json();
+                const data = await parseApiResponse(res, 'Failed to generate image.');
                 if (data.success) {
                     const images = Array.isArray(data.images) && data.images.length
                         ? data.images
@@ -656,7 +721,7 @@
                     setActiveGeneratedImage(0);
                     hideError();
                 } else {
-                    showError(data.error || 'Failed to generate image.');
+                    showError((data.error || 'Failed to generate image.') + networkDebugInfo());
                 }
             } catch (e) {
                 showError('Network error: ' + e.message + networkDebugInfo());

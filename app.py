@@ -75,6 +75,21 @@ def get_server_api_key() -> str:
     return os.environ.get('OPENAI_API_KEY', '').strip()
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def parse_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 def is_port_in_use(host: str, port: int) -> bool:
     """Return True when a local TCP port is already bound by another process."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -190,15 +205,15 @@ def get_narrative_response(user_query: str, conversation_history: list, api_key:
         return f"An error occurred: {e}", conversation_history
 
 
-def generate_image(prompt: str, api_key: str) -> str:
+def generate_image(prompt: str, api_key: str, size: str = "1024x1024", quality: str = "hd") -> str:
     """Generate an image using DALL-E based on a textual prompt."""
     try:
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, timeout=45.0)
         response = client.images.generate(
             model="dall-e-3",
             prompt=prompt,
-            size="1024x1024",
-            quality="hd",
+            size=size,
+            quality=quality,
             style="natural",
             n=1
         )
@@ -233,7 +248,7 @@ def datamosh_generated_image(image_url: str, job_id: str) -> tuple[bool, str]:
             f.write(image_bytes)
 
         # Create a short moving clip from the still so delta frames exist to mosh.
-        ret = subprocess.call([
+        ret = subprocess.run([
             ffmpeg_cmd(), '-loglevel', 'error', '-y',
             '-loop', '1',
             '-i', input_image_path,
@@ -249,7 +264,7 @@ def datamosh_generated_image(image_url: str, job_id: str) -> tuple[bool, str]:
             '-pix_fmt', 'yuv420p',
             '-an',
             source_video_path
-        ])
+        ], timeout=20).returncode
         if ret != 0 or not os.path.exists(source_video_path):
             return False, image_url
 
@@ -265,18 +280,20 @@ def datamosh_generated_image(image_url: str, job_id: str) -> tuple[bool, str]:
         if not mosh_result.get('success') or not os.path.exists(moshed_video_path):
             return False, image_url
 
-        ret = subprocess.call([
+        ret = subprocess.run([
             ffmpeg_cmd(), '-loglevel', 'error', '-y',
             '-ss', '1.2',
             '-i', moshed_video_path,
             '-frames:v', '1',
             output_image_path
-        ])
+        ], timeout=15).returncode
         if ret != 0 or not os.path.exists(output_image_path):
             return False, image_url
 
         schedule_delete(output_image_path, delay_seconds=900)
         return True, f'/api/generated-image/{os.path.basename(output_image_path)}'
+    except subprocess.TimeoutExpired:
+        return False, image_url
     except Exception:
         return False, image_url
     finally:
@@ -301,7 +318,7 @@ def infer_movement_matrix(prompt: str, api_key: str, grid_size: int = 8) -> dict
     ]
 
     try:
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, timeout=18.0)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -1139,11 +1156,25 @@ def generate_image_endpoint():
     image_count = data.get('image_count', 1)
     api_key = get_server_api_key()
 
+    started_at = time.time()
+    is_render = bool(os.environ.get('RENDER'))
+    fast_mode_default = is_render or env_flag('IMAGE_FAST_MODE', default=False)
+    fast_mode = parse_bool(data.get('fast_mode'), default=fast_mode_default)
+    apply_datamosh = parse_bool(data.get('apply_datamosh'), default=not fast_mode)
+    compute_matrix = parse_bool(data.get('compute_matrix'), default=not fast_mode)
+    image_size = "1024x1024"
+    image_quality = "hd"
+    if fast_mode:
+        image_quality = "standard"
+
     try:
         image_count = int(image_count)
     except (TypeError, ValueError):
         image_count = 1
     image_count = max(1, min(4, image_count))
+    # Hosted deployments are stricter about request timeout windows.
+    if is_render:
+        image_count = min(image_count, 2)
 
     if not prompt:
         prompt = narrative_to_image_prompt(job_id, fallback_prompt=video_influences.get(job_id, ''))
@@ -1162,33 +1193,88 @@ def generate_image_endpoint():
         f"Dream narrative direction: {prompt} "
         f"Video frame cues to ground composition, setting, and mood: {frame_context or 'Use realistic visual continuity with the uploaded video.'}"
     )
-    movement_matrix = infer_movement_matrix(enhanced_prompt, api_key, grid_size=matrix_size)
+    # Compute matrix in parallel to reduce request wall time.
+    matrix_holder = {
+        'value': {
+            "basis": "estimated_from_prompt",
+            "grid_size": max(2, min(16, int(matrix_size) if str(matrix_size).isdigit() else 8)),
+            "vectors": [],
+            "summary": "No reliable motion estimate was produced; returning a zero matrix."
+        }
+    }
+    matrix_grid_size = matrix_holder['value']['grid_size']
+    matrix_holder['value']['vectors'] = [
+        [{"dx": 0.0, "dy": 0.0, "magnitude": 0.0} for _ in range(matrix_grid_size)]
+        for _ in range(matrix_grid_size)
+    ]
+
+    matrix_thread = None
+    if compute_matrix:
+        def movement_worker():
+            matrix_holder['value'] = infer_movement_matrix(enhanced_prompt, api_key, grid_size=matrix_size)
+
+        matrix_thread = threading.Thread(target=movement_worker, daemon=True)
+        matrix_thread.start()
+
     base_job_id = job_id or str(uuid.uuid4())[:8]
     images = []
+    max_sync_seconds = float(os.environ.get('IMAGE_REQUEST_MAX_SECONDS', '45'))
 
     for idx in range(image_count):
-        image_url = generate_image(enhanced_prompt, api_key)
+        elapsed = time.time() - started_at
+        if idx > 0 and elapsed >= max_sync_seconds:
+            break
+
+        image_url = generate_image(enhanced_prompt, api_key, size=image_size, quality=image_quality)
         if "Error" in image_url:
             return jsonify({'error': image_url}), 500
 
-        datamosh_ok, final_image_url = datamosh_generated_image(image_url, f'{base_job_id}_{idx + 1}')
+        # If we are nearing timeout budget, return raw generated image URL instead of risking a gateway 502.
+        near_budget = (time.time() - started_at) >= (max_sync_seconds * 0.75)
+        if near_budget or not apply_datamosh:
+            datamosh_ok, final_image_url = False, image_url
+        else:
+            datamosh_ok, final_image_url = datamosh_generated_image(image_url, f'{base_job_id}_{idx + 1}')
         images.append({
             'image_url': final_image_url,
             'original_image_url': image_url,
             'datamosh_applied': datamosh_ok
         })
 
+    if not images:
+        return jsonify({'error': 'Image generation timed out before a result was produced.'}), 504
+
+    if matrix_thread is not None:
+        matrix_wait_budget = max(0.0, max_sync_seconds - (time.time() - started_at))
+        matrix_thread.join(timeout=min(3.0, matrix_wait_budget))
+    movement_matrix = matrix_holder['value']
+
     first_image = images[0]
+
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    print(
+        f"[generate-image] completed in {elapsed_ms}ms "
+        f"(requested_count={image_count}, returned_count={len(images)}, "
+        f"first_datamosh={first_image['datamosh_applied']}, "
+        f"fast_mode={fast_mode}, matrix={compute_matrix})",
+        flush=True
+    )
 
     return jsonify({
         'success': True,
         'image_url': first_image['image_url'],
         'original_image_url': first_image['original_image_url'],
         'datamosh_applied': first_image['datamosh_applied'],
-        'image_count': image_count,
+        'image_count': len(images),
+        'requested_image_count': image_count,
         'images': images,
         'prompt': prompt,
-        'movement_matrix': movement_matrix
+        'movement_matrix': movement_matrix,
+        'fast_mode': fast_mode,
+        'apply_datamosh': apply_datamosh,
+        'compute_matrix': compute_matrix,
+        'image_quality': image_quality,
+        'image_size': image_size
     })
 
 
